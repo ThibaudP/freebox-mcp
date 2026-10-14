@@ -124,3 +124,39 @@ async def test_request_hook_refuses_login_and_foreign_targets(url):
     with pytest.raises(PolicyError):
         await hook(req)
     assert "X-Fbx-App-Auth" not in req.headers
+
+
+# Firmware answers {"success": true} with no "result" for these empty collections.
+def _absent_result(method, path, body=None):
+    inner = httpx.MockTransport(lambda r: httpx.Response(200, json=body or {"success": True}))
+    t = FreeboxTransport(inner, _Session())
+    return t.handle_async_request(httpx.Request(method, f"https://mafreebox.freebox.fr{path}"))
+
+
+@pytest.mark.parametrize("path", ["/api/v16/dhcp/static_lease/", "/api/v16/fw/redir/"])
+async def test_absent_result_on_known_empty_collection_get_is_empty_list(path):
+    assert (await _absent_result("GET", path)).json() == []
+
+
+@pytest.mark.parametrize(
+    "method,path,body,expected",
+    [
+        ("GET", "/api/v16/dhcp/static_lease/", {"success": True, "result": []}, []),
+        ("GET", "/api/v16/dhcp/static_lease/", {"success": True, "result": None}, None),
+        ("GET", "/api/v16/dhcp/static_lease/", {"success": True, "result": {"a": 1}}, {"a": 1}),
+        ("GET", "/api/v16/dhcp/config/", None, {"success": True}),
+        ("GET", "/api/v16/dhcp/static_lease/3", None, {"success": True}),
+        ("GET", "/api/v16/fw/redir/3/", None, {"success": True}),
+        ("GET", "/api/v16/fw/redirx/", None, {"success": True}),
+        ("POST", "/api/v16/dhcp/static_lease/", None, {"success": True}),
+        ("PUT", "/api/v16/fw/redir/", None, {"success": True}),
+    ],
+)
+async def test_absent_result_normalisation_is_scoped(method, path, body, expected):
+    assert (await _absent_result(method, path, body)).json() == expected
+
+
+async def test_error_on_empty_collection_get_is_not_treated_as_empty():
+    body = {"success": False, "error_code": "nodev", "msg": "x"}
+    resp = await _absent_result("GET", "/api/v16/fw/redir/", body)
+    assert resp.status_code == 409 and resp.json()["error_code"] == "nodev"

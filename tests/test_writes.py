@@ -535,3 +535,25 @@ async def test_policy_still_blocks_writes_if_tools_bypassed(lan):
         await client.post("/fw/redir/", json=NEW_FWD)
     await client.aclose()
     assert not post.called
+
+
+@pytest.mark.parametrize(
+    "tool,args,route",
+    [
+        (
+            "dhcp_static_lease_create",
+            {"mac": "aa:bb:cc:dd:ee:01", "ip": "192.168.1.30"},
+            "dhcp/static_lease",
+        ),
+        ("nat_port_forward_create", NEW_FWD, "fw/redir"),
+    ],
+)
+async def test_create_preview_with_absent_result_empty_state(writes, lan, tool, args, route):
+    # firmware answers {"success": true} without "result" for an empty collection
+    lan.get(f"{API}/dhcp/static_lease/").respond(json={"success": True})
+    lan.get(f"{API}/fw/redir/").respond(json={"success": True})
+    post = lan.post(f"{API}/{route}/").respond(json=ok({}))
+    res = await _call(tool, args)
+    assert res["mode"] == "preview" and res["applied"] is False
+    assert res["diff"]["before"] is None
+    assert not post.called

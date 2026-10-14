@@ -84,3 +84,18 @@ async def test_unpaired_box_is_a_clear_error(box, isolated_env):
         await client.get("/system/")
     await client.aclose()
     await session.aclose()
+
+
+async def test_empty_collection_get_through_client_is_empty_list(box):
+    box.get(f"{ORIGIN}{PREFIX}/fw/redir/").respond(json={"success": True})
+    settings = Settings()
+    store = TokenStore(settings.credentials_path)
+    endpoint = choose_endpoint(settings, fetch_discovery(settings))
+    session = build_session_manager(settings, endpoint, store)
+    client = build_client(settings, endpoint, session)
+    try:
+        resp = await client.get("/fw/redir/")
+    finally:
+        await client.aclose()
+        await session.aclose()
+    assert resp.json() == []

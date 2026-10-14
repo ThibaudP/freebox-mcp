@@ -34,6 +34,10 @@ _SECRET_FIELD_RE = re.compile(
 )
 REDACTED = "<redacted>"
 
+# Firmware answers ``{"success": true}`` with no ``result`` for these collections when empty.
+EMPTY_COLLECTION_GET_PATHS = frozenset({"/dhcp/static_lease/", "/fw/redir/"})
+_API_PREFIX_RE = re.compile(r"^/api/v\d+(?=/)")
+
 
 def redact(data: object) -> object:
     """Recursively replace secret-named values; identifiers (MAC/IP/ids) are kept."""
@@ -158,7 +162,15 @@ class FreeboxTransport(httpx.AsyncBaseTransport):
             ), False
 
         if body["success"]:
-            result = body.get("result", {"success": True})
+            if "result" in body:
+                result = body["result"]
+            elif (
+                request.method == "GET"
+                and _API_PREFIX_RE.sub("", request.url.path, count=1) in EMPTY_COLLECTION_GET_PATHS
+            ):
+                result = []
+            else:
+                result = {"success": True}
             return _json_response(200, redact(result), request), False
 
         error_code = body.get("error_code")
