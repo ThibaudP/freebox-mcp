@@ -151,6 +151,11 @@ def test_discovery_rejects_malformed_api_base_url():
 
 def test_ssl_context_trusts_only_bundled_freebox_cas():
     ctx = freebox_ssl_context(str(CERT_BUNDLE))
+    default = ssl.create_default_context(cafile=str(CERT_BUNDLE))
+    # Only X509_STRICT is cleared (Freebox leaves lack an AKI); every other
+    # default verification flag is kept.
+    assert not ctx.verify_flags & ssl.VERIFY_X509_STRICT
+    assert ctx.verify_flags == default.verify_flags & ~ssl.VERIFY_X509_STRICT
     assert ctx.verify_mode == ssl.CERT_REQUIRED
     assert ctx.check_hostname is True
     assert ctx.minimum_version >= ssl.TLSVersion.TLSv1_2

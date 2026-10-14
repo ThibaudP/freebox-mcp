@@ -194,6 +194,9 @@ and delete `$XDG_CONFIG_HOME/freebox-mcp/credentials.json`.
 
 - Not validated against a real Freebox Pop: API v16, HTTPS on `mafreebox.freebox.fr`, redaction
   coverage and permission behaviour are unverified.
+- Freebox leaf certificates have no Authority Key Identifier, which Python >= 3.13 rejects under
+  its default `VERIFY_X509_STRICT`. Only that flag is cleared (`src/freebox_mcp/tls.py`); CA
+  pinning, `CERT_REQUIRED`, hostname checking and TLS >= 1.2 are unchanged.
 - The discovery flag `https_available` describes *remote* HTTPS access (`api_domain:https_port`),
   which this server never uses. It is shown by `discover` for information only and does not gate
   the local origin, which is HTTPS by construction and verified on every connection.

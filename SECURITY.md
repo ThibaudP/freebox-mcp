@@ -15,7 +15,10 @@ server treats tool input as untrusted.
 - **HTTPS only, pinned origin.** Discovery (`/api_version`) and all API calls go to
   one configured origin (`FREEBOX_API_BASE_URL`, default `https://mafreebox.freebox.fr`),
   verified against the **bundled Freebox root CAs only** (`src/freebox_mcp/certs/`;
-  the system trust store is not used). There is no HTTP fallback: discovery errors,
+  the system trust store is not used), with `CERT_REQUIRED`, hostname checking and
+  TLS >= 1.2. Only OpenSSL's `VERIFY_X509_STRICT` (Python >= 3.13 default) is
+  cleared, because Freebox leaf certificates lack an Authority Key Identifier;
+  standard chain verification still applies. There is no HTTP fallback: discovery errors,
   `FREEBOX_TRANSPORT=http` or an `http://` base URL are errors. The remote-access
   fields advertised by discovery (`api_domain`, `https_port`, `https_available`)
   are informational only; they never select or gate the target.
