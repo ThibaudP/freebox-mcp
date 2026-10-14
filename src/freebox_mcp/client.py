@@ -1,11 +1,14 @@
 """The authenticated httpx client that FastMCP drives.
 
 Responsibilities layered on a plain httpx.AsyncClient:
-  * prepend ``/api/v{major}`` (from discovery) to every spec-relative path;
+  * resolve the API prefix (``/api/v{major}``) lazily from discovery on the
+    pinned HTTPS origin, and fail the call — never fall back — if that fails;
+  * enforce the runtime endpoint policy (``policy.authorize``) on the raw,
+    still-encoded path of every request and rewrite it to the canonical form;
   * inject the ``X-Fbx-App-Auth`` session header, opening/refreshing the session
     lazily and transparently retrying once on ``auth_required``;
   * unwrap the Freebox ``APIResponse`` envelope so tools return ``result`` and
-    surface ``success: false`` as a clean error.
+    surface ``success: false``, redirects and non-JSON replies as clean errors.
 """
 
 from __future__ import annotations
@@ -13,38 +16,71 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 
 import httpx
 
 from .auth import FreeboxError, Session, TokenStore, open_session
 from .config import Settings
-from .discovery import Endpoint
+from .discovery import Endpoint, afetch_discovery, choose_endpoint
+from .policy import PolicyError, authorize
 from .tls import freebox_ssl_context
 
 log = logging.getLogger("freebox_mcp.client")
 
+# Field names whose values are secrets (Wi-Fi keys, WPS PINs, passwords, tokens).
+_SECRET_FIELD_RE = re.compile(
+    r"(?i)(^key$|_key$|^key_|^psk$|passphrase|password|passwd|secret|token|(^|_)pin$)"
+)
+REDACTED = "<redacted>"
+
+
+def redact(data: object) -> object:
+    """Recursively replace secret-named values; identifiers (MAC/IP/ids) are kept."""
+    if isinstance(data, dict):
+        return {
+            k: REDACTED if _SECRET_FIELD_RE.search(str(k)) else redact(v) for k, v in data.items()
+        }
+    if isinstance(data, list):
+        return [redact(v) for v in data]
+    return data
+
 
 class SessionManager:
-    """Lazily opens and caches a Freebox session, refreshing on demand."""
+    """Lazily resolves the endpoint, opens and caches a Freebox session."""
 
-    def __init__(self, raw: httpx.AsyncClient, prefix: str, app_id: str, app_token: str | None):
+    def __init__(
+        self,
+        raw: httpx.AsyncClient,
+        settings: Settings,
+        store: TokenStore,
+        endpoint: Endpoint | None = None,
+    ):
         self._raw = raw
-        self._prefix = prefix
-        self._app_id = app_id
-        self._app_token = app_token
+        self._settings = settings
+        self._store = store
+        self._endpoint = endpoint
+        self._app_id = settings.app_id
+        self._app_token: str | None = None
         self._token: str | None = None
         self.permissions: dict = {}
         self._lock = asyncio.Lock()
+        self._endpoint_lock = asyncio.Lock()
 
     @property
     def registered(self) -> bool:
         return bool(self._app_token)
 
-    def set_app_token(self, app_token: str, app_id: str | None = None) -> None:
-        self._app_token = app_token
-        if app_id:
-            self._app_id = app_id
-        self._token = None  # force a fresh session next call
+    async def endpoint(self) -> Endpoint:
+        if self._endpoint is None:
+            async with self._endpoint_lock:
+                if self._endpoint is None:
+                    discovery = await afetch_discovery(self._settings, self._raw)
+                    self._endpoint = choose_endpoint(self._settings, discovery)
+        return self._endpoint
+
+    async def prefix(self) -> str:
+        return (await self.endpoint()).api_path_prefix
 
     async def get_token(self) -> str:
         if self._token:
@@ -61,6 +97,10 @@ class SessionManager:
 
     async def _open(self) -> str:
         """Open a new session. The caller must hold self._lock."""
+        endpoint = await self.endpoint()
+        creds = self._store.get(endpoint.discovery.uid)
+        if creds:
+            self._app_token, self._app_id = creds.app_token, creds.app_id
         if not self._app_token:
             raise FreeboxError(
                 "This app is not authorized on the Freebox yet. Run `freebox-mcp authorize` "
@@ -68,12 +108,15 @@ class SessionManager:
                 error_code="not_registered",
             )
         session: Session = await open_session(
-            self._raw, self._prefix, self._app_id, self._app_token
+            self._raw, endpoint.api_path_prefix, self._app_id, self._app_token
         )
         self._token = session.session_token
         self.permissions = session.permissions
         log.debug("opened Freebox session (permissions: %s)", sorted(session.permissions))
         return self._token
+
+    async def aclose(self) -> None:
+        await self._raw.aclose()
 
 
 class FreeboxTransport(httpx.AsyncBaseTransport):
@@ -99,29 +142,34 @@ class FreeboxTransport(httpx.AsyncBaseTransport):
     def _process(
         self, response: httpx.Response, request: httpx.Request, allow_retry: bool
     ) -> tuple[httpx.Response, bool]:
-        ctype = response.headers.get("content-type", "")
-        if "json" not in ctype:
-            return response, False  # binary payloads (downloads) pass through
-        try:
-            body = json.loads(response.content)
-        except (json.JSONDecodeError, ValueError):
-            return response, False
+        if response.is_redirect:
+            return _error(request, "redirect_refused", "redirects are never followed"), False
+        body = None
+        if "json" in response.headers.get("content-type", ""):
+            try:
+                body = json.loads(response.content)
+            except (json.JSONDecodeError, ValueError):
+                body = None
         if not isinstance(body, dict) or "success" not in body:
-            return response, False
+            return _error(
+                request,
+                "unexpected_response",
+                f"HTTP {response.status_code} without a Freebox JSON envelope",
+            ), False
 
         if body["success"]:
             result = body.get("result", {"success": True})
-            return _json_response(200, result, request), False
+            return _json_response(200, redact(result), request), False
 
         error_code = body.get("error_code")
         if error_code == "auth_required" and allow_retry and self._session.registered:
             return response, True
-        payload = {
-            "freebox_error": True,
-            "error_code": error_code,
-            "msg": body.get("msg", "Freebox API error"),
-        }
-        return _json_response(409, payload, request), False
+        return _error(request, error_code, body.get("msg", "Freebox API error")), False
+
+
+def _error(request: httpx.Request, error_code: str | None, msg: str) -> httpx.Response:
+    payload = {"freebox_error": True, "error_code": error_code, "msg": msg}
+    return _json_response(409, payload, request)
 
 
 def _json_response(status: int, data: object, request: httpx.Request) -> httpx.Response:
@@ -133,46 +181,48 @@ def _json_response(status: int, data: object, request: httpx.Request) -> httpx.R
     )
 
 
-def _make_request_hook(session: SessionManager, prefix: str):
+def _make_request_hook(session: SessionManager, settings: Settings):
+    origin = httpx.URL(settings.origin)
+
     async def hook(request: httpx.Request) -> None:
-        path = request.url.path
-        if not path.startswith(prefix + "/") and not path.startswith("/api/"):
-            request.url = request.url.copy_with(path=prefix + path)
-            path = request.url.path
-        if "/login/" not in path:
-            request.headers["X-Fbx-App-Auth"] = await session.get_token()
+        url = request.url
+        if url.scheme != "https" or url.netloc != origin.netloc:
+            raise PolicyError(f"request target {url.scheme}://{url.host} refused", request)
+        canonical = authorize(request.method, url.raw_path, writes_enabled=settings.enable_writes)
+        prefix = await session.prefix()
+        # Set the raw, already-encoded path: never re-derive it from a decoded one.
+        request.url = url.copy_with(raw_path=(prefix + canonical).encode("ascii"))
+        request.headers["X-Fbx-App-Auth"] = await session.get_token()
 
     return hook
 
 
-def _verify(settings: Settings, endpoint: Endpoint):
-    if endpoint.secure:
-        return freebox_ssl_context(str(settings.cert_bundle))
-    return True
+def _verify(settings: Settings):
+    return freebox_ssl_context(str(settings.cert_bundle))
 
 
 def build_session_manager(
-    settings: Settings, endpoint: Endpoint, store: TokenStore
+    settings: Settings, endpoint: Endpoint | None, store: TokenStore
 ) -> SessionManager:
-    creds = store.get(endpoint.discovery.uid)
-    app_token = creds.app_token if creds else None
-    app_id = creds.app_id if creds else settings.app_id
+    """Session client: used only for discovery and the /login/ handshake."""
     raw = httpx.AsyncClient(
-        base_url=endpoint.base_url,
-        verify=_verify(settings, endpoint),
+        base_url=settings.origin,
+        verify=_verify(settings),
         timeout=settings.request_timeout,
+        follow_redirects=False,
     )
-    return SessionManager(raw, endpoint.api_path_prefix, app_id, app_token)
+    return SessionManager(raw, settings, store, endpoint)
 
 
 def build_client(
-    settings: Settings, endpoint: Endpoint, session: SessionManager
+    settings: Settings, endpoint: Endpoint | None, session: SessionManager
 ) -> httpx.AsyncClient:
-    inner = httpx.AsyncHTTPTransport(verify=_verify(settings, endpoint), retries=1)
+    inner = httpx.AsyncHTTPTransport(verify=_verify(settings), retries=1)
     transport = FreeboxTransport(inner, session)
     return httpx.AsyncClient(
-        base_url=endpoint.base_url,
+        base_url=settings.origin,
         transport=transport,
         timeout=settings.request_timeout,
-        event_hooks={"request": [_make_request_hook(session, endpoint.api_path_prefix)]},
+        follow_redirects=False,
+        event_hooks={"request": [_make_request_hook(session, settings)]},
     )

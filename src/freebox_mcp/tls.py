@@ -8,6 +8,8 @@ from functools import lru_cache
 
 @lru_cache(maxsize=4)
 def freebox_ssl_context(cafile: str) -> ssl.SSLContext:
-    """An SSL context that trusts the Freebox root CAs (and only the system +
-    those). Used for verified HTTPS to the box."""
-    return ssl.create_default_context(cafile=cafile)
+    """An SSL context that trusts ONLY the bundled Freebox root CAs (passing a
+    cafile skips the system store), with hostname checking and TLS >= 1.2."""
+    ctx = ssl.create_default_context(cafile=cafile)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    return ctx

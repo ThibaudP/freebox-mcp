@@ -13,5 +13,5 @@ COPY --from=builder /dist/*.whl /tmp/
 RUN pip install --no-cache-dir /tmp/*.whl && rm -rf /tmp/*.whl
 USER app
 WORKDIR /home/app
-# stdio MCP by default; pass `--http --host 0.0.0.0` to serve over HTTP.
+# stdio MCP only (there is no HTTP server mode). Local builds only; nothing is published.
 ENTRYPOINT ["freebox-mcp"]

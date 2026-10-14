@@ -1,10 +1,14 @@
-"""Transport behaviour: envelope unwrap, error surfacing, auth retry, path prefix."""
+"""Transport behaviour: envelope unwrap, error surfacing, auth retry, path prefix,
+and the fail-closed handling of non-envelope replies."""
 
 from __future__ import annotations
 
 import httpx
+import pytest
 
 from freebox_mcp.client import FreeboxTransport, _make_request_hook
+from freebox_mcp.config import Settings
+from freebox_mcp.policy import PolicyError
 
 
 class _Session:
@@ -20,13 +24,16 @@ class _Session:
     async def get_token(self):
         return self._token
 
+    async def prefix(self):
+        return "/api/v16"
+
     async def refresh(self):
         self.refreshed += 1
         self._token = "refreshed-tok"
         return self._token
 
 
-def _req(url="http://box/api/v16/system/"):
+def _req(url="https://mafreebox.freebox.fr/api/v16/system/"):
     return httpx.Request("GET", url)
 
 
@@ -72,7 +79,7 @@ async def test_auth_required_triggers_one_retry():
     assert calls["n"] == 2
 
 
-async def test_non_json_passthrough():
+async def test_non_json_reply_is_an_error_not_passed_through():
     inner = httpx.MockTransport(
         lambda r: httpx.Response(
             200, content=b"BINARYDATA", headers={"content-type": "application/octet-stream"}
@@ -80,20 +87,40 @@ async def test_non_json_passthrough():
     )
     t = FreeboxTransport(inner, _Session())
     resp = await t.handle_async_request(_req())
-    assert resp.content == b"BINARYDATA"
+    assert resp.status_code == 409
+    assert resp.json()["error_code"] == "unexpected_response"
+    assert b"BINARYDATA" not in resp.content
+
+
+async def test_redirect_reply_is_an_error():
+    inner = httpx.MockTransport(
+        lambda r: httpx.Response(302, headers={"location": "https://evil.example/"})
+    )
+    resp = await FreeboxTransport(inner, _Session()).handle_async_request(_req())
+    assert resp.status_code == 409
+    assert resp.json()["error_code"] == "redirect_refused"
 
 
 async def test_request_hook_prefixes_path_and_injects_token():
-    hook = _make_request_hook(_Session(), "/api/v16")
-    req = httpx.Request("GET", "http://box/wifi/config/")
+    hook = _make_request_hook(_Session(), Settings())
+    req = httpx.Request("GET", "https://mafreebox.freebox.fr/wifi/config/")
     await hook(req)
     assert req.url.path == "/api/v16/wifi/config/"
     assert req.headers["X-Fbx-App-Auth"] == "sess-tok"
 
 
-async def test_request_hook_skips_login_auth_header():
-    hook = _make_request_hook(_Session(), "/api/v16")
-    req = httpx.Request("GET", "http://box/login/")
-    await hook(req)
-    assert req.url.path == "/api/v16/login/"
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://mafreebox.freebox.fr/login/",
+        "http://mafreebox.freebox.fr/system/",
+        "https://evil.example/system/",
+        "https://mafreebox.freebox.fr:8443/system/",
+    ],
+)
+async def test_request_hook_refuses_login_and_foreign_targets(url):
+    hook = _make_request_hook(_Session(), Settings())
+    req = httpx.Request("GET", url)
+    with pytest.raises(PolicyError):
+        await hook(req)
     assert "X-Fbx-App-Auth" not in req.headers

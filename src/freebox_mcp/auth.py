@@ -15,10 +15,12 @@ and is never logged.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import hmac
 import json
 import os
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,8 +40,14 @@ def compute_password(app_token: str, challenge: str) -> str:
 
 
 def _result(resp: httpx.Response) -> dict:
-    body = resp.json()
-    if not body.get("success", False):
+    if resp.is_redirect:
+        raise FreeboxError("redirect refused on an authentication request", "redirect_refused")
+    try:
+        body = resp.json()
+    except ValueError as exc:
+        raise FreeboxError(f"HTTP {resp.status_code}: not a Freebox JSON reply") from exc
+    if not isinstance(body, dict) or not body.get("success", False):
+        body = body if isinstance(body, dict) else {}
         raise FreeboxError(body.get("msg", "Freebox API error"), body.get("error_code"))
     return body.get("result", {})
 
@@ -56,7 +64,7 @@ class BoxCredentials:
 
 
 class TokenStore:
-    """Per-box app_token storage at credentials_path (mode 0600)."""
+    """Per-box app_token storage at credentials_path (file 0600, directory 0700)."""
 
     def __init__(self, path: Path):
         self.path = path
@@ -84,17 +92,22 @@ class TokenStore:
             "track_id": creds.track_id,
             "box_model": creds.box_model,
         }
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        # Write atomically with restrictive permissions.
-        tmp = self.path.with_suffix(".tmp")
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as f:
-            json.dump(data, f, indent=2)
-        os.replace(tmp, self.path)
+        # Private directory (0700), then an atomic write via a unique 0600 temp file.
+        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(self.path.parent, 0o700)
+        fd, tmp = tempfile.mkstemp(prefix=".credentials-", dir=self.path.parent)
         try:
-            os.chmod(self.path, 0o600)
-        except OSError:
-            pass
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w") as f:
+                json.dump(data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self.path)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+            raise
+        os.chmod(self.path, 0o600)
 
 
 # --------------------------------------------------------------------------- #

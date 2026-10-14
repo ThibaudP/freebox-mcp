@@ -1,12 +1,15 @@
 [project]
 name = "freebox-mcp"
 version = "0.1.2"
-description = "Spec-driven MCP server for the Freebox OS API, generated from the official documentation."
+description = "Hardened stdio MCP server for the Freebox OS API (Freebox Pop V1 fork of Nelson-PROIA/freebox-mcp)."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [{ name = "Nelson Proia" }]
 keywords = ["freebox", "mcp", "model-context-protocol", "openapi", "freebox-os"]
+# This fork is for local installs only: PyPI rejects uploads carrying this classifier,
+# so the inherited "freebox-mcp" name can never be published from here by mistake.
+classifiers = ["Private :: Do Not Upload"]
 
 # Runtime deps are intentionally lean: the server only needs to load a JSON
 # OpenAPI document and speak HTTP/MCP. No HTML/parsing libs at runtime.

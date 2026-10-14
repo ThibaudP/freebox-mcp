@@ -31,14 +31,16 @@ jobs:
         with:
           version: "0.11.7"
           enable-cache: true
-      - name: Install
-        run: uv sync --group dev --python ${{ matrix.python-version }}
+      - name: Install (locked)
+        run: uv sync --frozen --group dev --python ${{ matrix.python-version }}
       - name: Lint
         run: |
-          uv run ruff check .
-          uv run ruff format --check .
-      - name: Test
-        run: uv run pytest -q
+          uv run --frozen ruff check .
+          uv run --frozen ruff format --check .
+      - name: Test (offline, mocked box only)
+        run: uv run --frozen pytest -q -m "not live"
+      # Build only to check packaging. This fork never publishes (no release
+      # workflow; the package carries the "Private :: Do Not Upload" classifier).
       - name: Build distribution
         run: uv build
 
@@ -56,24 +58,8 @@ jobs:
         with:
           version: "0.11.7"
       - name: Rebuild spec from committed cache (offline, deterministic)
-        run: uv run python -m tools.build --offline
+        run: uv run --frozen python -m tools.build --offline
       - name: Assert no drift in the shipped spec
         run: |
           git diff --exit-code -- spec/freebox-openapi.json \
             || { echo "::error::spec/freebox-openapi.json drifted. Run 'python -m tools.build --offline' and commit."; exit 1; }
-
-  supply-chain-audit:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
-        with:
-          egress-policy: audit
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
-        with:
-          version: "0.11.7"
-      - name: Dependency vulnerability audit
-        run: uvx pip-audit --progress-spinner off .
-        continue-on-error: true

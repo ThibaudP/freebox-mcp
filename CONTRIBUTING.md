@@ -35,7 +35,13 @@ per-section data, no patching the output.
 
 ## Releases
 
-The scrape runs on a France-reachable host (a Pi cron, `scripts/regenerate.sh`) because
-`dev.freebox.fr` blocks GitHub-hosted runners; on a spec change it tags + pushes, and the `release`
-workflow (tag-triggered) publishes to PyPI (OIDC), GHCR (signed), and GitHub Releases. To cut one
-manually, push a `vX.Y.Z` tag.
+This fork does not publish anything: there is no release workflow, no auto-merge, and no
+regeneration cron. The package carries the `Private :: Do Not Upload` classifier so the inherited
+`freebox-mcp` name cannot be uploaded to PyPI by mistake. Install it locally (see README).
+
+## Hardened-fork rules
+
+- The runtime endpoint allowlist lives in `src/freebox_mcp/policy.py`; the exposed read tools in
+  `READ_OPERATIONS` (`server.py`); the write tools in `writes.py`. Adding an endpoint means
+  touching the allowlist **and** adding tests (allowed + traversal/denied cases).
+- Never add an HTTP server mode, an arbitrary-endpoint tool, or a cleartext transport.
